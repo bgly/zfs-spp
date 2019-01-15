@@ -103,6 +103,10 @@ int zopt_objects = 0;
 libzfs_handle_t *g_zfs;
 uint64_t max_inflight = 1000;
 
+const uint64_t f_block_size = 4096;
+const uint64_t f_shift = 12;
+const uint64_t f_partition_offset = 2048;
+
 static void snprintf_blkptr_compact(char *, size_t, const blkptr_t *);
 
 /*
@@ -202,6 +206,8 @@ usage(void)
 	    "dump all read blocks into specified directory\n");
 	(void) fprintf(stderr, "        -X attempt extreme rewind (does not "
 	    "work with dataset)\n");
+	(void) fprintf(stderr, "        -Z <path> -- writes blocks to a file in"
+	    "blockmap format\n");
 	(void) fprintf(stderr, "Specify an option more than once (e.g. -bb) "
 	    "to make only that option verbose\n");
 	(void) fprintf(stderr, "Default is to dump everything non-verbosely\n");
@@ -1285,6 +1291,64 @@ print_indirect(blkptr_t *bp, const zbookmark_phys_t *zb,
 }
 
 static int
+write_indirect_blocks(spa_t *spa, const dnode_phys_t *dnp,
+    blkptr_t *bp, const zbookmark_phys_t *zb, FILE *blockmap_file)
+{
+	int i;
+	int bufSize;
+	char *buf;
+	int err = 0;
+
+	if (bp->blk_birth == 0)
+		return (0);
+
+	for (i = 0; i < BP_GET_NDVAS(bp); i++){
+		u_longlong_t f_offset = (u_longlong_t)(((DVA_GET_OFFSET(&(bp->blk_dva)[i]) + VDEV_LABEL_START_SIZE) 
+			>> f_shift) + f_partition_offset + 1);
+		u_longlong_t f_num_blocks = (u_longlong_t)(DVA_GET_ASIZE(&(bp->blk_dva)[i]) / f_block_size);
+		bufSize = snprintf(NULL, 0, "%llu: %llu\n", f_offset, f_num_blocks) + 1;
+		buf = malloc(bufSize);
+		snprintf(buf, bufSize, "%llu: %llu\n", f_offset, f_num_blocks);
+		fwrite(buf , 1, bufSize, blockmap_file);
+		free(buf);
+	}
+
+	if (BP_GET_LEVEL(bp) > 0 && !BP_IS_HOLE(bp)) {
+		arc_flags_t flags = ARC_FLAG_WAIT;
+		int i;
+		blkptr_t *cbp;
+		int epb = BP_GET_LSIZE(bp) >> SPA_BLKPTRSHIFT;
+		arc_buf_t *buf;
+		uint64_t fill = 0;
+
+		err = arc_read(NULL, spa, bp, arc_getbuf_func, &buf,
+		    ZIO_PRIORITY_ASYNC_READ, ZIO_FLAG_CANFAIL, &flags, zb);
+		if (err)
+			return (err);
+		ASSERT(buf->b_data);
+
+		/* recursively visit blocks below this */
+		cbp = buf->b_data;
+		for (i = 0; i < epb; i++, cbp++) {
+			zbookmark_phys_t czb;
+
+			SET_BOOKMARK(&czb, zb->zb_objset, zb->zb_object,
+			    zb->zb_level - 1,
+			    zb->zb_blkid * epb + i);
+			err = write_indirect_blocks(spa, dnp, cbp, &czb, blockmap_file);
+			if (err)
+				break;
+			fill += BP_GET_FILL(cbp);
+		}
+		if (!err)
+			ASSERT3U(fill, ==, BP_GET_FILL(bp));
+		arc_buf_destroy(buf, &buf);
+	}
+
+	return (err);
+}
+
+static int
 visit_indirect(spa_t *spa, const dnode_phys_t *dnp,
     blkptr_t *bp, const zbookmark_phys_t *zb)
 {
@@ -2062,6 +2126,76 @@ dump_object(objset_t *os, uint64_t object, int verbosity, int *print_header,
 
 static char *objset_types[DMU_OST_NUMTYPES] = {
 	"NONE", "META", "ZPL", "ZVOL", "OTHER", "ANY" };
+
+
+static void
+dump_file_block(objset_t *os, uint64_t object, FILE *blockmap_file)
+{
+	int error;
+	dnode_t *dn;
+	dmu_object_info_t doi;
+	boolean_t dnode_held = B_FALSE;
+	dmu_buf_t *db = NULL;
+	
+
+	if (object == 0) {
+		dn = DMU_META_DNODE(os);
+		dmu_object_info_from_dnode(dn, &doi);
+	} else {
+		error = dmu_object_info(os, object, &doi);
+		if (error)
+			fatal("dmu_object_info() failed, errno %u", error);
+
+		if (os->os_encrypted &&
+			DMU_OT_IS_ENCRYPTED(doi.doi_bonus_type)) {
+			error = dnode_hold(os, object, FTAG, &dn);
+			if (error)
+				fatal("dnode_hold() failed, errno %u", error);
+			dnode_held = B_TRUE;
+		} else {
+			error = dmu_bonus_hold(os, object, FTAG, &db);
+			if (error)
+				fatal("dmu_bonus_hold(%llu) failed, errno %u",
+					object, error);
+			dn = DB_DNODE((dmu_buf_impl_t *)db);
+		}
+	}
+
+	if (db != NULL)
+		dmu_buf_rele(db, FTAG);
+	if (dnode_held)
+		dnode_rele(dn, FTAG);
+
+	int j;
+	dnode_phys_t *dnp = dn->dn_phys;
+	zbookmark_phys_t czb;
+
+	SET_BOOKMARK(&czb, dmu_objset_id(dn->dn_objset),
+		dn->dn_object, dnp->dn_nlevels - 1, 0);
+	
+	for (j = 0; j < dnp->dn_nblkptr; j++) {
+		czb.zb_blkid = j;
+		(void) write_indirect_blocks(dmu_objset_spa(dn->dn_objset), dnp,
+			&dnp->dn_blkptr[j], &czb, blockmap_file);
+	}	
+}
+
+static void
+dump_file_blocks(objset_t *os, char *blockmap_file_path)
+{
+	if (zopt_objects != 0 && dump_opt['d'] >= 5) {
+		int i;
+		FILE *blockmap_file = fopen(blockmap_file_path, "wb");
+
+		for (i = 0; i < zopt_objects; i++){
+			dump_file_block(os, zopt_object[i], blockmap_file);
+		}
+
+		fclose(blockmap_file);
+
+	}
+
+}
 
 static void
 dump_dir(objset_t *os)
@@ -4199,6 +4333,7 @@ main(int argc, char **argv)
 	int flags = ZFS_IMPORT_MISSING_LOG;
 	int rewind = ZPOOL_NEVER_REWIND;
 	char *spa_config_path_env;
+	char *blockmap_file_path = NULL;
 	boolean_t target_is_spa = B_TRUE;
 
 	(void) setrlimit(RLIMIT_NOFILE, &rl);
@@ -4216,7 +4351,7 @@ main(int argc, char **argv)
 		spa_config_path = spa_config_path_env;
 
 	while ((c = getopt(argc, argv,
-	    "AbcCdDeEFGhiI:lLmMo:Op:PqRsSt:uU:vVx:X")) != -1) {
+	    "AbcCdDeEFGhiI:klLmMo:Op:PqRsSt:uU:vVx:XZ:")) != -1) {
 		switch (c) {
 		case 'b':
 		case 'c':
@@ -4302,6 +4437,21 @@ main(int argc, char **argv)
 			break;
 		case 'x':
 			vn_dumpdir = optarg;
+			break;
+		case 'Z':
+			if (optarg != NULL){
+				blockmap_file_path = optarg;
+				if (blockmap_file_path[0] != '/') {
+					(void) fprintf(stderr,
+					    "blockmap file must be saved to an absolute path "
+					    "(i.e. start with a slash)\n");
+					usage();
+				}
+			} else {
+				(void) fprintf(stderr,
+				    "absolute path to save blockmap file required\n");
+				usage();
+			}
 			break;
 		default:
 			usage();
@@ -4494,7 +4644,11 @@ main(int argc, char **argv)
 			}
 		}
 		if (os != NULL) {
-			dump_dir(os);
+			if (blockmap_file_path != NULL){
+				dump_file_blocks(os, blockmap_file_path);
+			} else {
+				dump_dir(os);
+			}
 		} else if (zopt_objects > 0 && !dump_opt['m']) {
 			dump_dir(spa->spa_meta_objset);
 		} else {
