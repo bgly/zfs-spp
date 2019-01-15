@@ -1309,7 +1309,7 @@ write_indirect_blocks(spa_t *spa, const dnode_phys_t *dnp,
 		bufSize = snprintf(NULL, 0, "%llu: %llu\n", f_offset, f_num_blocks) + 1;
 		buf = malloc(bufSize);
 		snprintf(buf, bufSize, "%llu: %llu\n", f_offset, f_num_blocks);
-		fwrite(buf , 1, bufSize, blockmap_file);
+		fwrite(buf, sizeof(char), bufSize, blockmap_file);
 		free(buf);
 	}
 
@@ -2131,11 +2131,13 @@ static char *objset_types[DMU_OST_NUMTYPES] = {
 static void
 dump_file_block(objset_t *os, uint64_t object, FILE *blockmap_file)
 {
+	int j;
 	int error;
 	dnode_t *dn;
 	dmu_object_info_t doi;
 	boolean_t dnode_held = B_FALSE;
 	dmu_buf_t *db = NULL;
+	zbookmark_phys_t czb;
 	
 
 	if (object == 0) {
@@ -2166,9 +2168,7 @@ dump_file_block(objset_t *os, uint64_t object, FILE *blockmap_file)
 	if (dnode_held)
 		dnode_rele(dn, FTAG);
 
-	int j;
 	dnode_phys_t *dnp = dn->dn_phys;
-	zbookmark_phys_t czb;
 
 	SET_BOOKMARK(&czb, dmu_objset_id(dn->dn_objset),
 		dn->dn_object, dnp->dn_nlevels - 1, 0);
@@ -2183,7 +2183,7 @@ dump_file_block(objset_t *os, uint64_t object, FILE *blockmap_file)
 static void
 dump_file_blocks(objset_t *os, char *blockmap_file_path)
 {
-	if (zopt_objects != 0 && dump_opt['d'] >= 5) {
+	if (zopt_objects != 0 && dump_opt['d'] >= 5 && blockmap_file_path != NULL) {
 		int i;
 		FILE *blockmap_file = fopen(blockmap_file_path, "wb");
 
@@ -2192,7 +2192,6 @@ dump_file_blocks(objset_t *os, char *blockmap_file_path)
 		}
 
 		fclose(blockmap_file);
-
 	}
 
 }
