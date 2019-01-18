@@ -779,6 +779,52 @@ dump_metaslab_stats(metaslab_t *msp)
 }
 
 static void
+dump_offset(objset_t *os, space_map_t *sm, FILE *blockmap_file)
+{
+	int bufSize;
+	char *buf;
+	uint64_t offset, entry;
+
+	if (sm == NULL)
+		return;
+
+	for (offset = 0; offset < space_map_length(sm);
+	    offset += sizeof (entry)) {
+		uint8_t mapshift = sm->sm_shift;
+
+		VERIFY0(dmu_read(os, space_map_object(sm), offset,
+		    sizeof (entry), &entry, DMU_READ_PREFETCH));
+
+		if (!SM_DEBUG_DECODE(entry) && SM_TYPE_DECODE(entry) == SM_ALLOC) {
+			u_longlong_t f_offset = (longlong_t) (((((SM_OFFSET_DECODE(entry) << mapshift) + sm->sm_start) + 
+				VDEV_LABEL_START_SIZE) >> f_shift) + f_partition_offset + 1);
+			u_longlong_t f_num_blocks = (longlong_t) ((SM_RUN_DECODE(entry) << mapshift) / f_block_size);
+			bufSize = snprintf(NULL, 0, "%llu: %llu\n", f_offset, f_num_blocks) + 1;
+			buf = malloc(bufSize);
+			snprintf(buf, bufSize, "%llu: %llu\n", f_offset, f_num_blocks);
+			fwrite(buf, sizeof(char), bufSize, blockmap_file);
+			free(buf);
+		}
+	}
+}
+
+static void
+dump_offsets(metaslab_t *msp, FILE *blockmap_file)
+{
+	vdev_t *vd = msp->ms_group->mg_vd;
+	spa_t *spa = vd->vdev_spa;
+
+	if (dump_opt['d'] > 5 || dump_opt['m'] > 3) {
+		ASSERT(msp->ms_size == (1ULL << vd->vdev_ms_shift));
+
+		mutex_enter(&msp->ms_lock);
+		dump_offset(spa->spa_meta_objset, msp->ms_sm,
+			blockmap_file);
+		mutex_exit(&msp->ms_lock);
+	}
+}
+
+static void
 dump_metaslab(metaslab_t *msp)
 {
 	vdev_t *vd = msp->ms_group->mg_vd;
@@ -878,6 +924,43 @@ dump_metaslab_groups(spa_t *spa)
 	else
 		(void) printf("\t%3llu%%\n", (u_longlong_t)fragmentation);
 	dump_histogram(mc->mc_histogram, RANGE_TREE_HISTOGRAM_SIZE, 0);
+}
+
+static void
+dump_blockmap(spa_t *spa, char *blockmap_file_path)
+{
+	vdev_t *vd, *rvd = spa->spa_root_vdev;
+	uint64_t m, c = 0, children = rvd->vdev_children;
+	FILE *blockmap_file = fopen(blockmap_file_path, "wb");
+
+	if (!dump_opt['d'] && zopt_objects > 0) {
+		c = zopt_object[0];
+
+		if (c >= children)
+			(void) fatal("bad vdev id: %llu", (u_longlong_t)c);
+
+		if (zopt_objects > 1) {
+			vd = rvd->vdev_child[c];
+
+			for (m = 1; m < zopt_objects; m++) {
+				if (zopt_object[m] < vd->vdev_ms_count)
+					dump_offsets(
+					    vd->vdev_ms[zopt_object[m]],
+					    blockmap_file);
+			}
+			fclose(blockmap_file);
+			return;
+		}
+		children = c + 1;
+	}
+	for (; c < children; c++) {
+		vd = rvd->vdev_child[c];
+
+		for (m = 0; m < vd->vdev_ms_count; m++)
+			dump_offsets(vd->vdev_ms[m],
+				blockmap_file);
+	}
+	fclose(blockmap_file);
 }
 
 static void
@@ -2135,38 +2218,21 @@ dump_file_block(objset_t *os, uint64_t object, FILE *blockmap_file)
 	int error;
 	dnode_t *dn;
 	dmu_object_info_t doi;
-	boolean_t dnode_held = B_FALSE;
 	dmu_buf_t *db = NULL;
 	zbookmark_phys_t czb;
-	
+
 
 	if (object == 0) {
 		dn = DMU_META_DNODE(os);
-		dmu_object_info_from_dnode(dn, &doi);
 	} else {
-		error = dmu_object_info(os, object, &doi);
+		error = dmu_bonus_hold(os, object, FTAG, &db);
 		if (error)
-			fatal("dmu_object_info() failed, errno %u", error);
-
-		if (os->os_encrypted &&
-			DMU_OT_IS_ENCRYPTED(doi.doi_bonus_type)) {
-			error = dnode_hold(os, object, FTAG, &dn);
-			if (error)
-				fatal("dnode_hold() failed, errno %u", error);
-			dnode_held = B_TRUE;
-		} else {
-			error = dmu_bonus_hold(os, object, FTAG, &db);
-			if (error)
-				fatal("dmu_bonus_hold(%llu) failed, errno %u",
-					object, error);
-			dn = DB_DNODE((dmu_buf_impl_t *)db);
-		}
+			fatal("dmu_bonus_hold(%llu) failed, errno %u",
+				object, error);
+		dn = DB_DNODE((dmu_buf_impl_t *)db);
 	}
 
-	if (db != NULL)
-		dmu_buf_rele(db, FTAG);
-	if (dnode_held)
-		dnode_rele(dn, FTAG);
+	dmu_object_info_from_dnode(dn, &doi);
 
 	dnode_phys_t *dnp = dn->dn_phys;
 
@@ -2177,7 +2243,10 @@ dump_file_block(objset_t *os, uint64_t object, FILE *blockmap_file)
 		czb.zb_blkid = j;
 		(void) write_indirect_blocks(dmu_objset_spa(dn->dn_objset), dnp,
 			&dnp->dn_blkptr[j], &czb, blockmap_file);
-	}	
+	}
+
+	if (db != NULL)
+		dmu_buf_rele(db, FTAG);	
 }
 
 static void
@@ -3809,7 +3878,7 @@ zdb_set_skip_mmp(char *target)
 }
 
 static void
-dump_zpool(spa_t *spa)
+dump_zpool(spa_t *spa, char *blockmap_file_path)
 {
 	dsl_pool_t *dp = spa_get_dsl(spa);
 	int rc = 0;
@@ -3833,8 +3902,14 @@ dump_zpool(spa_t *spa)
 	if (dump_opt['D'])
 		dump_all_ddts(spa);
 
-	if (dump_opt['d'] > 2 || dump_opt['m'])
-		dump_metaslabs(spa);
+	if (dump_opt['d'] > 2 || dump_opt['m']) {
+		if (blockmap_file_path != NULL) {
+			dump_blockmap(spa, blockmap_file_path);
+		} else {
+			dump_metaslabs(spa);
+		}
+	}
+		
 	if (dump_opt['M'])
 		dump_metaslab_groups(spa);
 
@@ -4651,7 +4726,7 @@ main(int argc, char **argv)
 		} else if (zopt_objects > 0 && !dump_opt['m']) {
 			dump_dir(spa->spa_meta_objset);
 		} else {
-			dump_zpool(spa);
+			dump_zpool(spa, blockmap_file_path);
 		}
 	} else {
 		flagbits['b'] = ZDB_FLAG_PRINT_BLKPTR;
