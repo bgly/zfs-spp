@@ -103,10 +103,6 @@ int zopt_objects = 0;
 libzfs_handle_t *g_zfs;
 uint64_t max_inflight = 1000;
 
-const uint64_t f_block_size = 4096;
-const uint64_t f_shift = 12;
-const uint64_t f_partition_offset = 2048;
-
 static void snprintf_blkptr_compact(char *, size_t, const blkptr_t *);
 
 /*
@@ -781,8 +777,8 @@ dump_metaslab_stats(metaslab_t *msp)
 static void
 dump_offset(objset_t *os, space_map_t *sm, FILE *blockmap_file)
 {
-	int bufSize;
-	char *buf;
+	int c = 64;
+	unsigned char buf[16];
 	uint64_t offset, entry;
 
 	if (sm == NULL)
@@ -796,14 +792,22 @@ dump_offset(objset_t *os, space_map_t *sm, FILE *blockmap_file)
 		    sizeof (entry), &entry, DMU_READ_PREFETCH));
 
 		if (!SM_DEBUG_DECODE(entry) && SM_TYPE_DECODE(entry) == SM_ALLOC) {
-			u_longlong_t f_offset = (longlong_t) (((((SM_OFFSET_DECODE(entry) << mapshift) + sm->sm_start) + 
-				VDEV_LABEL_START_SIZE) >> f_shift) + f_partition_offset + 1);
-			u_longlong_t f_num_blocks = (longlong_t) ((SM_RUN_DECODE(entry) << mapshift) / f_block_size);
-			bufSize = snprintf(NULL, 0, "%llu: %llu\n", f_offset, f_num_blocks) + 1;
-			buf = malloc(bufSize);
-			snprintf(buf, bufSize, "%llu: %llu\n", f_offset, f_num_blocks);
-			fwrite(buf, sizeof(char), bufSize, blockmap_file);
-			free(buf);
+			u_longlong_t f_offset = (longlong_t) ((SM_OFFSET_DECODE(entry) << mapshift) + sm->sm_start);
+			u_longlong_t f_num_blocks = (longlong_t) (SM_RUN_DECODE(entry) << mapshift);
+			
+			for(int i=0; i<16; i++){
+				c -= 8;
+				if (i < 8) {
+					buf[i] = (unsigned char) (f_offset >> c);
+					if (c == 0){
+						c = 64;
+					}
+				} else {
+					buf[i] = (unsigned char) (f_num_blocks >> c);
+				}
+			}
+
+			fwrite(&buf, sizeof(char), 16, blockmap_file);
 		}
 	}
 }
@@ -1378,22 +1382,30 @@ write_indirect_blocks(spa_t *spa, const dnode_phys_t *dnp,
     blkptr_t *bp, const zbookmark_phys_t *zb, FILE *blockmap_file)
 {
 	int i;
-	int bufSize;
-	char *buf;
+	int c = 64;
+	unsigned char buf[16];
 	int err = 0;
 
 	if (bp->blk_birth == 0)
 		return (0);
 
 	for (i = 0; i < BP_GET_NDVAS(bp); i++){
-		u_longlong_t f_offset = (u_longlong_t)(((DVA_GET_OFFSET(&(bp->blk_dva)[i]) + VDEV_LABEL_START_SIZE) 
-			>> f_shift) + f_partition_offset + 1);
-		u_longlong_t f_num_blocks = (u_longlong_t)(DVA_GET_ASIZE(&(bp->blk_dva)[i]) / f_block_size);
-		bufSize = snprintf(NULL, 0, "%llu: %llu\n", f_offset, f_num_blocks) + 1;
-		buf = malloc(bufSize);
-		snprintf(buf, bufSize, "%llu: %llu\n", f_offset, f_num_blocks);
-		fwrite(buf, sizeof(char), bufSize, blockmap_file);
-		free(buf);
+		u_longlong_t f_offset = (u_longlong_t)(DVA_GET_OFFSET(&(bp->blk_dva)[i]));
+		u_longlong_t f_num_blocks = (u_longlong_t)(DVA_GET_ASIZE(&(bp->blk_dva)[i]));
+
+		for(int j=0; j<16; j++){
+			c -= 8;
+			if (j < 8) {
+				buf[j] = (unsigned char) (f_offset >> c);
+				if (c == 0){
+					c = 64;
+				}
+			} else {
+				buf[j] = (unsigned char) (f_num_blocks >> c);
+			}
+		}
+
+		fwrite(&buf, sizeof(char), 16, blockmap_file);
 	}
 
 	if (BP_GET_LEVEL(bp) > 0 && !BP_IS_HOLE(bp)) {
